@@ -33,7 +33,6 @@ Do **not** commit keys. Set them in Railway → Service → Variables.
 ## Local run
 
 ```bash
-cd live-price-feed
 npm install
 export SUPABASE_URL="https://YOUR_PROJECT.supabase.co"
 export SUPABASE_SERVICE_ROLE_KEY="your-service-role-key"
