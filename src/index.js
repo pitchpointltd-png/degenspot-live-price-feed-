@@ -22,6 +22,14 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error('[fatal] SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required');
   process.exit(1);
 }
+// Price-monitor tick driver config (additive — see pingPriceMonitor below).
+// Declared AFTER SUPABASE_URL so the URL default can reference it (const TDZ).
+const PRICE_MONITOR_URL = process.env.PRICE_MONITOR_URL
+  || `${SUPABASE_URL}/functions/v1/price-monitor`;
+const PRICE_MONITOR_TICK_MS = Number(process.env.PRICE_MONITOR_TICK_MS) || 5000;
+const PRICE_MONITOR_TIMEOUT_MS = Number(process.env.PRICE_MONITOR_TIMEOUT_MS) || 8000;
+const PRICE_MONITOR_ENABLED =
+  (process.env.PRICE_MONITOR_ENABLED ?? 'true').toLowerCase() !== 'false';
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
@@ -39,6 +47,7 @@ let minuteBucket = null;
 let high = null;
 let low = null;
 let shuttingDown = false;
+let pmInFlight = false;
 function currentMinuteISO(ts = Date.now()) {
   const d = new Date(ts);
   d.setUTCSeconds(0, 0);
@@ -180,6 +189,37 @@ async function writeLoop() {
     console.error('[db] upsert threw', err?.message ?? err);
   }
 }
+async function pingPriceMonitor() {
+  // Fire-and-forget tick driver. Isolated from the price-write loop:
+  // its own try/catch + AbortController timeout + in-flight guard so it can
+  // never stall the 3s feed. Overlapping/duplicate ticks are safe on the
+  // server side (unique ledger_key index + status='open' close guard).
+  if (!PRICE_MONITOR_ENABLED) return;
+  if (pmInFlight) return; // skip if the previous tick is still running
+  pmInFlight = true;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PRICE_MONITOR_TIMEOUT_MS);
+  try {
+    const res = await fetch(PRICE_MONITOR_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      console.warn(`[pm] price-monitor ${res.status}`);
+    }
+  } catch (err) {
+    // aborted timeout or network hiccup — log concise, never rethrow
+    console.warn('[pm] ping failed', err?.name === 'AbortError' ? 'timeout' : (err?.message ?? err));
+  } finally {
+    clearTimeout(timer);
+    pmInFlight = false;
+  }
+}
 http.createServer((req, res) => {
   const ageMs = lastMsgAt ? Date.now() - lastMsgAt : null;
   const healthy = latestLast != null && ageMs != null && ageMs < STALE_MS;
@@ -199,4 +239,8 @@ process.on('uncaughtException', (e) => console.error('[sys] uncaughtException', 
 connect();
 setInterval(writeLoop, WRITE_INTERVAL_MS);
 setInterval(checkStale, 5_000);
+if (PRICE_MONITOR_ENABLED) {
+  setInterval(pingPriceMonitor, PRICE_MONITOR_TICK_MS);
+  console.log(`[boot] price-monitor tick every ${PRICE_MONITOR_TICK_MS}ms`);
+}
 console.log('[boot] live-price-feed started');
