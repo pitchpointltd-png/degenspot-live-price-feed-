@@ -157,7 +157,25 @@ async function writeLoop() {
       source: 'railway-bybit',
       updated_at: new Date().toISOString(),
     }, { onConflict: 'symbol' });
-    if (error) console.error('[db] upsert error', error.message);
+    if (error) {
+      console.error('[db] upsert error', error.message);
+    } else if (Number.isFinite(latestMark)) {
+      // Best-effort append to the ordered time-series. mark_price is NOT NULL,
+      // so skip the history row on any cycle where mark isn't a finite number.
+      // Failures here must never block or affect the authoritative live_price
+      // upsert or the WebSocket loop — swallow and log a concise warning.
+      try {
+        const { error: histError } = await supabase.from('live_price_history').insert({
+          symbol: SYMBOL,
+          mark_price: latestMark,
+          last_price: latestLast,
+          index_price: latestIndex,
+        });
+        if (histError) console.warn('[db] history insert error', histError.message);
+      } catch (histErr) {
+        console.warn('[db] history insert threw', histErr?.message ?? histErr);
+      }
+    }
   } catch (err) {
     console.error('[db] upsert threw', err?.message ?? err);
   }
