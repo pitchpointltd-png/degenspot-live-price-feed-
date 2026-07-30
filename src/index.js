@@ -1,13 +1,16 @@
 /**
- * DegenSpot Live Price Feed — Wave A / LW-A-A1 (Railway)
- * Always-on Node service: holds a persistent Binance USDⓈ-M futures aggTrade
+ * DegenSpot Live Price Feed — Wave A / LW-A-A2 (Railway)
+ * Always-on Node service: holds a persistent Bybit v5 public linear tickers
  * WebSocket and upserts the SINGLE live_price row (BTCUSDT) in Supabase every ~3s.
+ * Bybit tolerates cloud/datacenter IPs (Binance blocks Railway egress, so aggTrade
+ * sockets opened but never delivered messages).
  * Feed only — no fills, no trade_journal.
  */
 import { createClient } from '@supabase/supabase-js';
 import http from 'node:http';
 const SYMBOL = 'BTCUSDT';
-const BINANCE_WS_URL = 'wss://fstream.binance.com/stream?streams=btcusdt@aggTrade';
+const BYBIT_WS_URL = 'wss://stream.bybit.com/v5/public/linear';
+const HEARTBEAT_MS = 20_000;
 const WRITE_INTERVAL_MS = 3_000;
 const STALE_MS = 15_000;
 const RECONNECT_BASE_MS = 1_000;
@@ -24,9 +27,14 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 });
 let ws = null;
 let reconnectTimer = null;
+let heartbeatTimer = null;
 let reconnectDelay = RECONNECT_BASE_MS;
 let lastMsgAt = 0;
+let lastTicker = {};
 let latestPrice = null;
+let latestLast = null;
+let latestMark = null;
+let latestIndex = null;
 let minuteBucket = null;
 let high = null;
 let low = null;
@@ -49,32 +57,59 @@ function ingestTrade(price, ts) {
   }
   latestPrice = price;
 }
+function stopHeartbeat() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+}
+function handleTicker(msg) {
+  // Bybit sends a full "snapshot" first then partial "delta" messages that only
+  // carry changed fields — merge onto the last known ticker, never replace it.
+  Object.assign(lastTicker, msg.data);
+  const last = parseFloat(lastTicker.lastPrice);
+  const mark = parseFloat(lastTicker.markPrice);
+  const index = parseFloat(lastTicker.indexPrice);
+  if (Number.isFinite(last) && last > 0) {
+    latestLast = last;
+    ingestTrade(last, Number(msg.ts) || Date.now());
+  }
+  if (Number.isFinite(mark)) latestMark = mark;
+  if (Number.isFinite(index)) latestIndex = index;
+}
 function connect() {
   if (shuttingDown) return;
-  const socket = new WebSocket(BINANCE_WS_URL);
+  const socket = new WebSocket(BYBIT_WS_URL);
   ws = socket;
   socket.addEventListener('open', () => {
     if (ws !== socket) return;
     reconnectDelay = RECONNECT_BASE_MS;
     lastMsgAt = Date.now();
     console.log('[ws] open');
+    try {
+      socket.send(JSON.stringify({ op: 'subscribe', args: ['tickers.BTCUSDT'] }));
+    } catch (err) {
+      console.error('[ws] subscribe failed', err?.message ?? err);
+    }
+    stopHeartbeat();
+    heartbeatTimer = setInterval(() => {
+      if (ws === socket && socket.readyState === WebSocket.OPEN) {
+        try { socket.send(JSON.stringify({ op: 'ping' })); } catch { /* ignore */ }
+      }
+    }, HEARTBEAT_MS);
   });
   socket.addEventListener('message', (event) => {
     if (ws !== socket) return;
-    lastMsgAt = Date.now();
     try {
       const msg = JSON.parse(typeof event.data === 'string' ? event.data : String(event.data));
-      const data = msg?.data;
-      if (!data || data.p == null) return;
-      const price = parseFloat(data.p);
-      const tradeTs = Number(data.T ?? data.E) || Date.now();
-      ingestTrade(price, tradeTs);
+      if (msg?.op != null) return; // subscribe/pong ack — not price data
+      if (msg?.topic !== 'tickers.BTCUSDT' || !msg.data) return;
+      lastMsgAt = Date.now();
+      handleTicker(msg);
     } catch (err) {
       console.error('[ws] parse error', err?.message ?? err);
     }
   });
   socket.addEventListener('close', () => {
     if (ws !== socket) return;
+    stopHeartbeat();
     console.warn('[ws] closed');
     scheduleReconnect();
   });
@@ -96,6 +131,7 @@ function forceReconnect(reason) {
   console.warn(`[ws] force reconnect: ${reason}`);
   const dead = ws;
   ws = null;
+  stopHeartbeat();
   try { dead?.close(); } catch { /* ignore */ }
   scheduleReconnect();
 }
@@ -107,15 +143,18 @@ function checkStale() {
   }
 }
 async function writeLoop() {
-  if (latestPrice == null || latestPrice <= 0) return;
+  if (latestLast == null || latestLast <= 0) return;
   try {
     const { error } = await supabase.from('live_price').upsert({
       symbol: SYMBOL,
-      price: latestPrice,
-      high: high ?? latestPrice,
-      low: low ?? latestPrice,
+      price: latestLast,
+      last_price: latestLast,
+      mark_price: latestMark,
+      index_price: latestIndex,
+      high: high ?? latestLast,
+      low: low ?? latestLast,
       minute_bucket: minuteBucket ?? currentMinuteISO(),
-      source: 'railway',
+      source: 'railway-bybit',
       updated_at: new Date().toISOString(),
     }, { onConflict: 'symbol' });
     if (error) console.error('[db] upsert error', error.message);
@@ -125,9 +164,9 @@ async function writeLoop() {
 }
 http.createServer((req, res) => {
   const ageMs = lastMsgAt ? Date.now() - lastMsgAt : null;
-  const healthy = latestPrice != null && ageMs != null && ageMs < STALE_MS;
+  const healthy = latestLast != null && ageMs != null && ageMs < STALE_MS;
   res.writeHead(healthy ? 200 : 503, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ healthy, symbol: SYMBOL, price: latestPrice, high, low, minute_bucket: minuteBucket, last_msg_age_ms: ageMs }));
+  res.end(JSON.stringify({ healthy, symbol: SYMBOL, price: latestPrice, last: latestLast, mark: latestMark, index: latestIndex, high, low, minute_bucket: minuteBucket, last_msg_age_ms: ageMs }));
 }).listen(PORT, () => console.log(`[http] health server on :${PORT}`));
 function shutdown(sig) {
   console.log(`[sys] ${sig} — shutting down`);
