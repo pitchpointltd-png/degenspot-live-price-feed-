@@ -102,9 +102,16 @@ function roundQty(qty) {
   return parseFloat(Number(qty).toFixed(3));
 }
 
+// Work in whole 0.1 ticks so float division can never push a price into the
+// wrong bucket (65028.5 / 0.1 can evaluate to 650285.0000001 and ceil to 650286).
+const TICK = 0.1;
 function bucketPrice(price, stepNum, side) {
-  if (side === 'ask') return Math.ceil(price / stepNum) * stepNum;
-  return Math.floor(price / stepNum) * stepNum;
+  const priceTicks = Math.round(price / TICK);
+  const stepTicks = Math.round(stepNum / TICK);
+  const b = side === 'ask'
+    ? Math.ceil(priceTicks / stepTicks) * stepTicks
+    : Math.floor(priceTicks / stepTicks) * stepTicks;
+  return b / 10;
 }
 
 function buildStepLadder(map, step, side) {
