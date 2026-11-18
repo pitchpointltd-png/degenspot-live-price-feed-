@@ -126,7 +126,7 @@ function buildStepLadder(map, step, side) {
   const entries = [...buckets.entries()]
     .map(([p, q]) => [roundToStep(p, step), roundQty(q)])
     .sort((a, b) => (asc ? a[0] - b[0] : b[0] - a[0]));
-  return entries.slice(0, 8);
+  return entries.slice(0, 20);
 }
 
 function buildStepsPayload() {
