@@ -9,7 +9,7 @@ const SYMBOL = 'BTCUSDT';
 const SOURCE = 'railway-bybit-ob1000';
 const BYBIT_WS_URL = 'wss://stream.bybit.com/v5/public/linear';
 const ORDERBOOK_TOPIC = 'orderbook.1000.BTCUSDT';
-const STEPS = ['0.1', '1', '10', '100'];
+const STEPS = ['0.1', '1', '10', '50', '100', '1000'];
 
 const HEARTBEAT_MS = 20_000;
 const WRITE_INTERVAL_MS = 1_000;
